@@ -1,0 +1,444 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include "MAX30105.h"
+
+/* OLED */
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+/* WiFi */
+const char* ssid = "PROJECTWifi";
+const char* password = "project123";
+
+/* Objects */
+WebServer server(80);
+MAX30105 particleSensor;
+
+/* Raw Sensor */
+long irValue=0;
+long redValue=0;
+
+/* Processed */
+float irFiltered=0;
+float redFiltered=0;
+
+/* Buffers */
+#define FILTER_SIZE 8
+long irBuffer[FILTER_SIZE];
+long redBuffer[FILTER_SIZE];
+int bufIndex=0;
+
+/* Status */
+String blockageStatus="PLACE FINGER";
+
+float glucose=0;
+String glucoseStatus="WAIT";
+
+float hemoglobin=0;
+String hemoStatus="WAIT";
+
+int bpm=0;
+
+/* Finger */
+bool fingerPresent=false;
+
+/* Timing */
+unsigned long fingerStart=0;
+bool bpmReady=false;
+
+/* Stability */
+int stableCounter=0;
+bool stableSignal=false;
+
+/* History */
+#define HISTORY 10
+int bpmHist[HISTORY];
+float gluHist[HISTORY];
+float hemoHist[HISTORY];
+String blkHist[HISTORY];
+
+int idx=0;
+
+/* Calibration factors */
+
+float glucoseGain=1.05;
+float hemoGain=0.95;
+
+/* ================================================== */
+
+float computeAverage(long *arr)
+{
+long sum=0;
+
+for(int i=0;i<FILTER_SIZE;i++)
+sum+=arr[i];
+
+return (float)sum/FILTER_SIZE;
+}
+
+/* ================================================== */
+
+float smoothSignal(float prev,float current)
+{
+float alpha=0.4;
+return (alpha*current)+(1-alpha)*prev;
+}
+
+/* ================================================== */
+
+float calculateSignalQuality(float ir,float red)
+{
+
+float diff = abs(ir-red);
+
+float quality = map(diff,0,40000,100,10);
+
+quality = constrain(quality,10,100);
+
+return quality;
+
+}
+
+/* ================= WEB PAGE ================= */
+
+String getPage(){
+
+String page = R"====(
+<!DOCTYPE html>
+<html>
+<head>
+<meta name='viewport' content='width=device-width, initial-scale=1'>
+
+<style>
+
+body{
+font-family:Arial;
+color:white;
+text-align:center;
+background: linear-gradient(135deg,#1e3c72,#2a5298);
+}
+
+.card{
+background: rgba(255,255,255,0.1);
+padding:15px;
+margin:10px;
+border-radius:15px;
+box-shadow:0 4px 12px rgba(0,0,0,0.3);
+}
+
+canvas{
+background:white;
+border-radius:8px;
+margin-top:10px;
+}
+
+table{
+width:100%;
+color:white;
+border-collapse:collapse;
+}
+
+td,th{
+border-bottom:1px solid rgba(255,255,255,0.2);
+padding:6px;
+}
+
+.grid{
+display:grid;
+grid-template-columns:repeat(auto-fit,minmax(200px,1fr));
+gap:10px;
+}
+
+.box{
+background: rgba(255,255,255,0.1);
+padding:15px;
+border-radius:10px;
+font-size:18px;
+}
+
+</style>
+</head>
+
+<body>
+
+<h2>Health Gradient Dashboard</h2>
+
+<div class="grid">
+
+
+</div>
+
+<div class="card">
+
+<h3>BPM Graph</h3>
+<canvas id="bpmGraph" width="400" height="150"></canvas>
+
+<h3>Glucose Graph</h3>
+<canvas id="gluGraph" width="400" height="150"></canvas>
+
+<h3>Hemoglobin Graph</h3>
+<canvas id="hemoGraph" width="400" height="150"></canvas>
+
+</div>
+
+<div class="card">
+
+<h3>Last 10 Readings</h3>
+<table id="hist"></table>
+
+</div>
+
+<script>
+
+let bpmData=[]
+let gluData=[]
+let hemoData=[]
+let maxPoints=30
+
+async function updateData(){
+
+try{
+
+const res = await fetch('/status')
+const data = await res.json()
+
+
+if(bpmData.length>=maxPoints) bpmData.shift()
+if(gluData.length>=maxPoints) gluData.shift()
+if(hemoData.length>=maxPoints) hemoData.shift()
+
+bpmData.push(bpm)
+gluData.push(glu)
+hemoData.push(hemo)
+
+drawGraph("bpmGraph",bpmData,"#ff0000")
+drawGraph("gluGraph",gluData,"#ffff00")
+drawGraph("hemoGraph",hemoData,"#00ffcc")
+
+}catch(e){}
+
+}
+
+function drawGraph(id,data,color){
+
+let canvas=document.getElementById(id)
+let ctx=canvas.getContext('2d')
+
+ctx.clearRect(0,0,canvas.width,canvas.height)
+
+ctx.beginPath()
+ctx.strokeStyle=color
+ctx.lineWidth=2
+
+let stepX=canvas.width/(maxPoints-1)
+
+let maxY=Math.max(...data)*1.2
+if(maxY<1) maxY=1
+
+for(let i=0;i<data.length;i++){
+
+let y=canvas.height-(data[i]/maxY*canvas.height)
+
+if(i==0)
+ctx.moveTo(i*stepX,y)
+else
+ctx.lineTo(i*stepX,y)
+
+}
+
+ctx.stroke()
+
+}
+
+setInterval(updateData,1000)
+updateData()
+
+</script>
+
+</body>
+</html>
+)====";
+
+return page;
+}
+
+/* ================= SERVER ================= */
+
+void handleRoot(){
+server.send(200,"text/html",getPage());
+}
+
+void handleStatus(){
+
+String json="{";
+
+json += "\"block\":\""+blockageStatus+"\",";
+json += "\"glu\":\""+String(glucose,0)+"\",";
+json += "\"hemo\":\""+String(hemoglobin,1)+"\",";
+json += "\"bpm\":\""+String(bpm)+"\",";
+
+json += "\"hist\":[";
+
+for(int i=0;i<HISTORY;i++){
+
+json += "[\""+blkHist[i]+"\",\""+String(gluHist[i],0)+"\",\""+String(hemoHist[i],1)+"\",\""+String(bpmHist[i])+"\"]";
+
+if(i<HISTORY-1) json += ",";
+
+}
+
+json += "]}";
+
+server.send(200,"application/json",json);
+
+}
+
+/* ================= SETUP ================= */
+
+void setup(){
+
+Serial.begin(115200);
+
+Wire.begin(21,22);
+
+display.begin(SSD1306_SWITCHCAPVCC,0x3C);
+
+display.clearDisplay();
+display.setTextColor(WHITE);
+
+WiFi.softAP(ssid,password);
+
+server.on("/",handleRoot);
+server.on("/status",handleStatus);
+server.begin();
+
+particleSensor.begin(Wire);
+particleSensor.setup();
+
+particleSensor.setPulseAmplitudeRed(0x2A);
+particleSensor.setPulseAmplitudeIR(0x2A);
+
+}
+
+/* ================= LOOP ================= */
+
+void loop(){
+
+server.handleClient();
+
+irValue = particleSensor.getIR();
+redValue = particleSensor.getRed();
+
+/* Store to buffer */
+
+irBuffer[bufIndex]=irValue;
+redBuffer[bufIndex]=redValue;
+
+bufIndex++;
+if(bufIndex>=FILTER_SIZE) bufIndex=0;
+
+/* Average */
+
+float irAvg = computeAverage(irBuffer);
+float redAvg = computeAverage(redBuffer);
+
+/* Smooth */
+
+irFiltered = smoothSignal(irFiltered,irAvg);
+redFiltered = smoothSignal(redFiltered,redAvg);
+
+/* Finger detection */
+
+fingerPresent = (irFiltered > 50000);
+
+if(fingerPresent){
+
+stableCounter++;
+
+if(stableCounter>5) stableSignal=true;
+
+}
+else{
+
+stableCounter=0;
+stableSignal=false;
+
+}
+
+/* BPM estimation */
+
+if(stableSignal){
+
+bpmReady=true;
+
+bpm = map(irFiltered,50000,120000,60,110);
+
+bpm = constrain(bpm,60,120);
+
+}
+else{
+
+bpmReady=false;
+bpm=0;
+
+}
+
+/* Ratio calculation */
+
+float ratio = redFiltered/irFiltered;
+
+/* Glucose */
+
+glucose = (80 + ratio*110) * glucoseGain;
+
+/* Hemoglobin */
+
+hemoglobin = (10 + ratio*6) * hemoGain;
+
+/* Blockage */
+
+int perfusion = map(irFiltered,50000,120000,0,100);
+
+if(perfusion>70) blockageStatus="NORMAL";
+else if(perfusion>50) blockageStatus="SLIGHT";
+else if(perfusion>30) blockageStatus="MEDIUM";
+else blockageStatus="HIGH";
+
+/* History */
+
+blkHist[idx]=blockageStatus;
+gluHist[idx]=glucose;
+hemoHist[idx]=hemoglobin;
+bpmHist[idx]=bpm;
+
+idx=(idx+1)%HISTORY;
+
+/* OLED */
+
+display.clearDisplay();
+
+display.setCursor(0,0);
+display.print("BPM: ");
+display.print(bpm);
+
+display.setCursor(0,16);
+display.print("Block: ");
+display.print(blockageStatus);
+
+display.setCursor(0,32);
+display.print("Glu: ");
+display.print(glucose,0);
+
+display.setCursor(0,48);
+display.print("Hb: ");
+display.print(hemoglobin,1);
+
+display.display();
+
+delay(1000);
+
+}
